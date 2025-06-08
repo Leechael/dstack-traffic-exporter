@@ -13,8 +13,8 @@ all: linux
 
 # Build for Linux AMD64
 linux:
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o haproxy-sni-traffic-exporter-linux-amd64 main.go
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o dist/traffic-exporter-linux-amd64 main.go
 
 # Clean build artifacts
 clean:
-	rm -f haproxy-sni-traffic-exporter-linux-amd64
+	rm -f dist/*

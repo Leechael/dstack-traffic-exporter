@@ -1,4 +1,4 @@
-module github.com/Leechael/haproxy-sni-traffic-exporter
+module github.com/Leechael/traffic-exporter
 
 go 1.23.1
 

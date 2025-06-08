@@ -690,7 +690,7 @@ func startMetricsUpdater() {
 
 func main() {
 	flag.StringVar(&globalConfig.LogFile, "log", "/var/log/haproxy.log", "HAProxy log file to monitor")
-	flag.StringVar(&globalConfig.PositionFile, "pos", ".haproxy-sni-exporter.pos", "Position file for tail mode")
+	flag.StringVar(&globalConfig.PositionFile, "pos", ".traffic-exporter.pos", "Position file for tail mode")
 	flag.IntVar(&globalConfig.PrometheusPort, "port", 9100, "Prometheus metrics port")
 	flag.BoolVar(&globalConfig.ResetOnStart, "reset", false, "Reset position and start from beginning of file")
 	flag.DurationVar(&globalConfig.QEMUMonitorInterval, "qemu-monitor-interval", 5*time.Second, "Interval for QEMU process monitoring")
