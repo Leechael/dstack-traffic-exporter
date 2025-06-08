@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ var globalConfig struct {
 	PrometheusPort      int
 	ResetOnStart        bool
 	QEMUMonitorInterval time.Duration
+	DomainSuffix        string
 }
 
 // SNIStats 存储每个 SNI 的统计信息
@@ -64,6 +66,38 @@ type LogStats struct {
 type QEMUStats struct {
 	Processes map[int]*QEMUProcessStats
 	mu        sync.RWMutex
+}
+
+// Query response structures
+type NetworkBytes struct {
+	RX uint64 `json:"rx"`
+	TX uint64 `json:"tx"`
+}
+
+type HAProxyAppData struct {
+	TotalBytes  int64    `json:"total_bytes"`
+	Connections int      `json:"connections"`
+	ZeroBytes   int      `json:"zero_bytes"`
+	SNIs        []string `json:"snis"`
+}
+
+type QEMUNetworkData struct {
+	TotalBytes NetworkBytes `json:"total_bytes"`
+	Bytes30s   NetworkBytes `json:"30s_bytes"`
+	Bytes1min  NetworkBytes `json:"1min_bytes"`
+	Bytes5min  NetworkBytes `json:"5min_bytes"`
+	Bytes15min NetworkBytes `json:"15min_bytes"`
+	Bytes1h    NetworkBytes `json:"1h_bytes"`
+}
+
+type QueryResponse struct {
+	HAProxy map[string]HAProxyAppData  `json:"haproxy"`
+	QEMU    map[string]QEMUNetworkData `json:"qemu"`
+}
+
+type QueryRequest struct {
+	AppIDs []string `json:"appids"`
+	UUIDs  []string `json:"uuids"`
 }
 
 var (
@@ -367,6 +401,318 @@ func startTailingInternal(logFilePath string, posFilePath string, resetPosition 
 	go processTailLines(t, posFilePath)
 
 	return nil
+}
+
+// extractAppIDFromSNI extracts app ID from SNI
+// For configured domain suffix: extracts the first part and removes -xxx suffix if present
+// For other domains: returns the entire domain
+func extractAppIDFromSNI(sni string) string {
+	// Check if it's a configured domain suffix and suffix is not empty
+	if globalConfig.DomainSuffix != "" && strings.HasSuffix(sni, "."+globalConfig.DomainSuffix) {
+		// Find the first dot to get the subdomain part
+		if idx := strings.Index(sni, "."); idx != -1 {
+			subdomain := sni[:idx]
+
+			// Remove -xxx suffix if present (e.g., -80, -443, etc.)
+			if dashIdx := strings.LastIndex(subdomain, "-"); dashIdx != -1 {
+				// Check if everything after the dash is numeric (port number)
+				suffix := subdomain[dashIdx+1:]
+				if _, err := strconv.Atoi(suffix); err == nil {
+					return subdomain[:dashIdx]
+				}
+			}
+			return subdomain
+		}
+	}
+
+	// For other domains, return the entire SNI
+	return sni
+}
+
+// queryHAProxyDataByAppIDs queries HAProxy statistics by app IDs
+// If appIDs is empty, returns all available app data
+func queryHAProxyDataByAppIDs(appIDs []string) map[string]HAProxyAppData {
+	result := make(map[string]HAProxyAppData)
+
+	// Create a map for fast lookup if specific app IDs are requested
+	var appIDSet map[string]bool
+	returnAll := appIDs == nil || len(appIDs) == 0
+	if !returnAll {
+		appIDSet = make(map[string]bool)
+		for _, appID := range appIDs {
+			appIDSet[appID] = true
+		}
+	}
+
+	// First, collect all SNI data with minimal lock time
+	stats.mu.RLock()
+	sniDataSnapshot := make(map[string]struct {
+		TotalBytes  int64
+		Connections int
+		ZeroBytes   int
+	})
+
+	for sni, sniStat := range stats.SNIStats {
+		sniStat.mu.RLock()
+		sniDataSnapshot[sni] = struct {
+			TotalBytes  int64
+			Connections int
+			ZeroBytes   int
+		}{
+			TotalBytes:  sniStat.TotalBytes,
+			Connections: sniStat.Connections,
+			ZeroBytes:   sniStat.ZeroBytes,
+		}
+		sniStat.mu.RUnlock()
+	}
+	stats.mu.RUnlock()
+
+	// Now process the data without holding any locks
+	appData := make(map[string]*HAProxyAppData)
+
+	for sni, data := range sniDataSnapshot {
+		appID := extractAppIDFromSNI(sni)
+
+		// Filter by requested app IDs if specified
+		if !returnAll && !appIDSet[appID] {
+			continue
+		}
+
+		if appData[appID] == nil {
+			appData[appID] = &HAProxyAppData{
+				SNIs: make([]string, 0),
+			}
+		}
+
+		appData[appID].TotalBytes += data.TotalBytes
+		appData[appID].Connections += data.Connections
+		appData[appID].ZeroBytes += data.ZeroBytes
+		appData[appID].SNIs = append(appData[appID].SNIs, sni)
+	}
+
+	// Convert to result format
+	for appID, data := range appData {
+		result[appID] = *data
+	}
+
+	// Ensure all requested app IDs are in the result (even if empty) when specific IDs requested
+	if !returnAll {
+		for _, appID := range appIDs {
+			if _, exists := result[appID]; !exists {
+				result[appID] = HAProxyAppData{
+					SNIs: make([]string, 0),
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// queryQEMUDataByUUIDs queries QEMU statistics by UUIDs
+// If uuids is empty, returns all available QEMU data
+func queryQEMUDataByUUIDs(uuids []string) map[string]QEMUNetworkData {
+	result := make(map[string]QEMUNetworkData)
+
+	// Create a map for fast lookup if specific UUIDs are requested
+	var uuidSet map[string]bool
+	returnAll := uuids == nil || len(uuids) == 0
+	if !returnAll {
+		uuidSet = make(map[string]bool)
+		for _, uuid := range uuids {
+			uuidSet[uuid] = true
+		}
+	}
+
+	// First, collect process data with minimal lock time
+	qemuStats.mu.RLock()
+	processDataSnapshot := make(map[string][]NetworkSnapshot)
+
+	for _, processStats := range qemuStats.Processes {
+		uuid := processStats.UUID
+
+		// Filter by requested UUIDs if specified
+		if !returnAll && !uuidSet[uuid] {
+			continue
+		}
+
+		processStats.mu.RLock()
+		if len(processStats.Snapshots) > 0 {
+			// Copy snapshots to avoid holding locks during calculations
+			snapshots := make([]NetworkSnapshot, len(processStats.Snapshots))
+			copy(snapshots, processStats.Snapshots)
+			processDataSnapshot[uuid] = snapshots
+		}
+		processStats.mu.RUnlock()
+	}
+	qemuStats.mu.RUnlock()
+
+	// Process data without holding any locks
+	var processUUIDs []string
+	if returnAll {
+		processUUIDs = make([]string, 0, len(processDataSnapshot))
+		for uuid := range processDataSnapshot {
+			processUUIDs = append(processUUIDs, uuid)
+		}
+	} else {
+		processUUIDs = uuids
+	}
+
+	for _, uuid := range processUUIDs {
+		var networkData QEMUNetworkData
+
+		if snapshots, exists := processDataSnapshot[uuid]; exists && len(snapshots) > 0 {
+			// Get the latest snapshot for total bytes
+			latest := snapshots[len(snapshots)-1]
+			networkData.TotalBytes = NetworkBytes{
+				RX: latest.RxBytes,
+				TX: latest.TxBytes,
+			}
+
+			// Calculate windowed metrics
+			rx30s, tx30s := calculateBytesInWindow(snapshots, 30*time.Second)
+			networkData.Bytes30s = NetworkBytes{RX: rx30s, TX: tx30s}
+
+			rx1min, tx1min := calculateBytesInWindow(snapshots, 1*time.Minute)
+			networkData.Bytes1min = NetworkBytes{RX: rx1min, TX: tx1min}
+
+			rx5min, tx5min := calculateBytesInWindow(snapshots, 5*time.Minute)
+			networkData.Bytes5min = NetworkBytes{RX: rx5min, TX: tx5min}
+
+			rx15min, tx15min := calculateBytesInWindow(snapshots, 15*time.Minute)
+			networkData.Bytes15min = NetworkBytes{RX: rx15min, TX: tx15min}
+
+			rx1h, tx1h := calculateBytesInWindow(snapshots, 1*time.Hour)
+			networkData.Bytes1h = NetworkBytes{RX: rx1h, TX: tx1h}
+		}
+
+		result[uuid] = networkData
+	}
+
+	return result
+}
+
+// parseQueryParameters extracts app IDs and UUIDs from query parameters
+func parseQueryParameters(query map[string][]string) ([]string, []string) {
+	var appIDs, uuids []string
+
+	// Parse app IDs
+	if appIDsParam := query["appids"]; len(appIDsParam) > 0 && appIDsParam[0] != "" {
+		appIDs = strings.Split(appIDsParam[0], ",")
+		// Trim whitespace
+		for i := range appIDs {
+			appIDs[i] = strings.TrimSpace(appIDs[i])
+		}
+	}
+
+	// Parse UUIDs
+	if uuidsParam := query["uuids"]; len(uuidsParam) > 0 && uuidsParam[0] != "" {
+		uuids = strings.Split(uuidsParam[0], ",")
+		// Trim whitespace
+		for i := range uuids {
+			uuids[i] = strings.TrimSpace(uuids[i])
+		}
+	}
+
+	return appIDs, uuids
+}
+
+// queryHandler handles /query requests (supports both GET and POST)
+func queryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Supported methods: GET, POST", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var appIDs, uuids []string
+	var err error
+
+	switch r.Method {
+	case http.MethodGet:
+		// Parse query parameters
+		appIDs, uuids = parseQueryParameters(r.URL.Query())
+
+	case http.MethodPost:
+		// Parse JSON body
+		var req QueryRequest
+		if r.Header.Get("Content-Type") == "application/json" {
+			decoder := json.NewDecoder(r.Body)
+			if err := decoder.Decode(&req); err != nil {
+				http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+				return
+			}
+			appIDs = req.AppIDs
+			uuids = req.UUIDs
+		} else {
+			// Parse form data
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "Invalid form data", http.StatusBadRequest)
+				return
+			}
+			appIDs, uuids = parseQueryParameters(r.Form)
+		}
+	}
+
+	// Trim any empty strings from slices
+	appIDs = filterEmptyStrings(appIDs)
+	uuids = filterEmptyStrings(uuids)
+
+	// Query data
+	// Special case: if no parameters provided, return all data
+	hasAppIDParams := len(appIDs) > 0
+	hasUUIDParams := len(uuids) > 0
+
+	var haproxyData map[string]HAProxyAppData
+	var qemuData map[string]QEMUNetworkData
+
+	// If neither parameter is provided, return all data
+	if !hasAppIDParams && !hasUUIDParams {
+		haproxyData = queryHAProxyDataByAppIDs(nil) // nil means return all
+		qemuData = queryQEMUDataByUUIDs(nil)        // nil means return all
+	} else {
+		// Only query the data types that were specifically requested
+		if hasAppIDParams {
+			haproxyData = queryHAProxyDataByAppIDs(appIDs)
+		} else {
+			haproxyData = make(map[string]HAProxyAppData)
+		}
+
+		if hasUUIDParams {
+			qemuData = queryQEMUDataByUUIDs(uuids)
+		} else {
+			qemuData = make(map[string]QEMUNetworkData)
+		}
+	}
+
+	response := QueryResponse{
+		HAProxy: haproxyData,
+		QEMU:    qemuData,
+	}
+
+	// Return JSON response
+	w.Header().Set("Content-Type", "application/json")
+	if err = json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Error encoding query response: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Query request processed (%s): appids=%v, uuids=%v", r.Method, appIDs, uuids)
+}
+
+// filterEmptyStrings removes empty strings from slice
+func filterEmptyStrings(slice []string) []string {
+	if slice == nil {
+		return nil
+	}
+
+	result := make([]string, 0, len(slice))
+	for _, s := range slice {
+		if strings.TrimSpace(s) != "" {
+			result = append(result, strings.TrimSpace(s))
+		}
+	}
+	return result
 }
 
 func resetHandler(w http.ResponseWriter, r *http.Request) {
@@ -694,6 +1040,7 @@ func main() {
 	flag.IntVar(&globalConfig.PrometheusPort, "port", 9100, "Prometheus metrics port")
 	flag.BoolVar(&globalConfig.ResetOnStart, "reset", false, "Reset position and start from beginning of file")
 	flag.DurationVar(&globalConfig.QEMUMonitorInterval, "qemu-monitor-interval", 5*time.Second, "Interval for QEMU process monitoring")
+	flag.StringVar(&globalConfig.DomainSuffix, "domain-suffix", "phala.network", "Domain suffix for app ID extraction (e.g., phala.network)")
 	flag.Parse()
 
 	// Start periodic metrics updater
@@ -701,8 +1048,9 @@ func main() {
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/reset", resetHandler)
+	http.HandleFunc("/query", queryHandler)
 	go func() {
-		log.Printf("Starting Prometheus server with /reset endpoint on :%d", globalConfig.PrometheusPort)
+		log.Printf("Starting Prometheus server with /reset and /query endpoints on :%d", globalConfig.PrometheusPort)
 		if err := http.ListenAndServe(fmt.Sprintf(":%d", globalConfig.PrometheusPort), nil); err != nil {
 			log.Fatalf("Failed to start HTTP server: %v", err)
 		}
