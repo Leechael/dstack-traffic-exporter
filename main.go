@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +23,11 @@ import (
 
 // Config global config
 var globalConfig struct {
-	LogFile        string
-	PositionFile   string
-	PrometheusPort int
-	TailMode       bool
-	ResetOnStart   bool
+	LogFile             string
+	PositionFile        string
+	PrometheusPort      int
+	ResetOnStart        bool
+	QEMUMonitorInterval time.Duration
 }
 
 // SNIStats 存储每个 SNI 的统计信息
@@ -37,6 +38,21 @@ type SNIStats struct {
 	mu          sync.RWMutex
 }
 
+// NetworkSnapshot represents network stats at a specific time
+type NetworkSnapshot struct {
+	Timestamp time.Time
+	RxBytes   uint64
+	TxBytes   uint64
+}
+
+// QEMUProcessStats stores network statistics for a QEMU process
+type QEMUProcessStats struct {
+	PID       int
+	UUID      string
+	Snapshots []NetworkSnapshot
+	mu        sync.RWMutex
+}
+
 // LogStats 存储全局统计信息
 type LogStats struct {
 	SNIStats       map[string]*SNIStats
@@ -44,9 +60,17 @@ type LogStats struct {
 	lastReportTime time.Time
 }
 
-var (
-	stats LogStats
+// QEMUStats stores all QEMU process statistics
+type QEMUStats struct {
+	Processes map[int]*QEMUProcessStats
+	mu        sync.RWMutex
+}
 
+var (
+	stats     LogStats
+	qemuStats QEMUStats
+
+	// Original HAProxy SNI metrics
 	sniBytes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "haproxy_sni_total_bytes",
@@ -69,40 +93,96 @@ var (
 		[]string{"sni"},
 	)
 
+	// QEMU network metrics
+	qemuTotalBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_total_bytes",
+			Help: "Total network bytes for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+	qemu30sBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_30s_bytes",
+			Help: "Network bytes in last 30 seconds for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+	qemu1minBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_1min_bytes",
+			Help: "Network bytes in last 1 minute for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+	qemu5minBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_5min_bytes",
+			Help: "Network bytes in last 5 minutes for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+	qemu15minBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_15min_bytes",
+			Help: "Network bytes in last 15 minutes for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+	qemu1hBytes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "qemu_network_1h_bytes",
+			Help: "Network bytes in last 1 hour for QEMU process",
+		},
+		[]string{"uuid", "direction"},
+	)
+
 	currentTailInstance     *tail.Tail
 	currentTailInstanceLock sync.Mutex
 	tailWg                  sync.WaitGroup // To wait for tailing goroutine to finish
+
+	// QEMU monitoring
+	qemuMonitorTicker *time.Ticker
+	qemuMonitorDone   chan bool
 )
 
 func init() {
 	prometheus.MustRegister(sniBytes)
 	prometheus.MustRegister(sniConnections)
 	prometheus.MustRegister(sniZeroBytes)
+	prometheus.MustRegister(qemuTotalBytes)
+	prometheus.MustRegister(qemu30sBytes)
+	prometheus.MustRegister(qemu1minBytes)
+	prometheus.MustRegister(qemu5minBytes)
+	prometheus.MustRegister(qemu15minBytes)
+	prometheus.MustRegister(qemu1hBytes)
+
 	stats = LogStats{
 		SNIStats:       make(map[string]*SNIStats),
 		lastReportTime: time.Now(),
 	}
+	qemuStats = QEMUStats{
+		Processes: make(map[int]*QEMUProcessStats),
+	}
 }
 
 func updatePrometheusMetrics() {
-	// log.Printf("[Prometheus] updatePrometheusMetrics called") // Can be verbose
+	// Update HAProxy SNI metrics only if we have data
 	stats.mu.RLock()
-	defer stats.mu.RUnlock()
-	for sni, sniStat := range stats.SNIStats {
-		sniStat.mu.RLock()
-		sniBytes.WithLabelValues(sni).Set(float64(sniStat.TotalBytes))
-		sniConnections.WithLabelValues(sni).Set(float64(sniStat.Connections))
-		sniZeroBytes.WithLabelValues(sni).Set(float64(sniStat.ZeroBytes))
-		sniStat.mu.RUnlock()
+	if len(stats.SNIStats) > 0 {
+		for sni, sniStat := range stats.SNIStats {
+			sniStat.mu.RLock()
+			sniBytes.WithLabelValues(sni).Set(float64(sniStat.TotalBytes))
+			sniConnections.WithLabelValues(sni).Set(float64(sniStat.Connections))
+			sniZeroBytes.WithLabelValues(sni).Set(float64(sniStat.ZeroBytes))
+			sniStat.mu.RUnlock()
+		}
 	}
+	stats.mu.RUnlock()
 }
 
 func processLine(line string) {
-	if !globalConfig.TailMode {
-		// log.Printf("STDIN_MODE: Processing line: %s", line) // Can be verbose
-	} else {
-		// log.Printf("TAIL_MODE (nxadm/tail): Processing line: %s", line) // Can be verbose
-	}
+	// log.Printf("Processing line: %s", line) // Can be verbose
 	idx := strings.Index(line, "SNI=")
 	if idx == -1 {
 		// log.Printf("No SNI found for line: %s", line) // Can be verbose
@@ -156,8 +236,8 @@ func processLine(line string) {
 	// log.Printf("Stats for SNI %s updated: TotalBytes=%d, Connections=%d, ZeroBytes=%d", // Can be verbose
 	// 	sni, sniStat.TotalBytes, sniStat.Connections, sniStat.ZeroBytes)
 
-	updatePrometheusMetrics()
-	// log.Printf("Prometheus metrics updated via updatePrometheusMetrics() for SNI: %s", sni) // Can be verbose
+	// Only update Prometheus metrics periodically, not on every line
+	// updatePrometheusMetrics() will be called by a periodic updater
 }
 
 func readStartingOffset(posFile string) (int64, error) {
@@ -293,38 +373,337 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("Received /reset request.")
 	resetStats()
 
-	if globalConfig.TailMode {
-		log.Println("TailMode enabled, attempting to reset and restart tailing...")
-		err := startTailingInternal(globalConfig.LogFile, globalConfig.PositionFile, true)
-		if err != nil {
-			log.Printf("Error restarting tailing: %v", err)
-			http.Error(w, fmt.Sprintf("Failed to reset and restart tailing: %v", err), http.StatusInternalServerError)
-			return
-		}
-		log.Println("Tailing restarted successfully after reset.")
-		fmt.Fprintln(w, "Metrics and tailing position reset successfully.")
-	} else {
-		log.Println("Stdin mode, only metrics were reset.")
-		fmt.Fprintln(w, "Metrics reset successfully (stdin mode, no tail position to reset).")
+	// Reset QEMU stats (always enabled)
+	qemuStats.mu.Lock()
+	qemuStats.Processes = make(map[int]*QEMUProcessStats)
+	qemuStats.mu.Unlock()
+
+	// Reset QEMU Prometheus gauges
+	qemuTotalBytes.Reset()
+	qemu30sBytes.Reset()
+	qemu1minBytes.Reset()
+	qemu5minBytes.Reset()
+	qemu15minBytes.Reset()
+	qemu1hBytes.Reset()
+
+	log.Println("QEMU stats and metrics have been reset.")
+
+	// Reset HAProxy log tailing (always enabled)
+	log.Println("Attempting to reset and restart HAProxy log tailing...")
+	err := startTailingInternal(globalConfig.LogFile, globalConfig.PositionFile, true)
+	if err != nil {
+		log.Printf("Error restarting tailing: %v", err)
+		fmt.Fprintln(w, "HAProxy and QEMU metrics reset successfully. Warning: Failed to reset HAProxy log tailing.")
+		return
 	}
+	log.Println("HAProxy log tailing restarted successfully after reset.")
+
+	fmt.Fprintln(w, "HAProxy metrics, QEMU metrics, and log tailing position reset successfully.")
+}
+
+// getQEMUProcesses discovers all QEMU processes and extracts their UUIDs
+func getQEMUProcesses() (map[int]string, error) {
+	processes := make(map[int]string)
+
+	files, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read /proc: %v", err)
+	}
+
+	for _, file := range files {
+		if !file.IsDir() {
+			continue
+		}
+
+		pid, err := strconv.Atoi(file.Name())
+		if err != nil {
+			continue
+		}
+
+		// Read command line
+		cmdlineFile := filepath.Join("/proc", file.Name(), "cmdline")
+		cmdlineBytes, err := os.ReadFile(cmdlineFile)
+		if err != nil {
+			continue
+		}
+
+		cmdline := string(cmdlineBytes)
+		if !strings.Contains(cmdline, "qemu-system") {
+			continue
+		}
+
+		// Extract UUID from command line
+		uuid := extractUUIDFromCmdline(cmdline)
+		if uuid != "" {
+			processes[pid] = uuid
+		}
+	}
+
+	return processes, nil
+}
+
+// extractUUIDFromCmdline extracts UUID from QEMU command line
+func extractUUIDFromCmdline(cmdline string) string {
+	// Try to extract from /opt/dstack/run/vm/UUID/ pattern
+	re := regexp.MustCompile(`run/vm/([^/\x00]+)`)
+	matches := re.FindStringSubmatch(cmdline)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+
+	// Try to extract from guest-cid parameter
+	re = regexp.MustCompile(`guest-cid=(\d+)`)
+	matches = re.FindStringSubmatch(cmdline)
+	if len(matches) > 1 {
+		return "CID-" + matches[1]
+	}
+
+	return ""
+}
+
+// getNetworkStats reads network statistics from /proc/{pid}/net/dev
+func getNetworkStats(pid int) (rxBytes, txBytes uint64, err error) {
+	netDevFile := filepath.Join("/proc", strconv.Itoa(pid), "net", "dev")
+	content, err := os.ReadFile(netDevFile)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for i, line := range lines {
+		if i < 2 { // Skip header lines
+			continue
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "lo:") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+
+		// Parse RX bytes (field 1) and TX bytes (field 9)
+		rx, err1 := strconv.ParseUint(fields[1], 10, 64)
+		tx, err2 := strconv.ParseUint(fields[9], 10, 64)
+
+		if err1 == nil && err2 == nil {
+			rxBytes += rx
+			txBytes += tx
+		}
+	}
+
+	return rxBytes, txBytes, nil
+}
+
+// cleanOldSnapshots removes snapshots older than 1 hour
+func cleanOldSnapshots(snapshots []NetworkSnapshot) []NetworkSnapshot {
+	cutoff := time.Now().Add(-1 * time.Hour)
+	cleaned := make([]NetworkSnapshot, 0, len(snapshots))
+
+	for _, snapshot := range snapshots {
+		if snapshot.Timestamp.After(cutoff) {
+			cleaned = append(cleaned, snapshot)
+		}
+	}
+
+	return cleaned
+}
+
+// calculateBytesInWindow calculates bytes transferred in a time window
+func calculateBytesInWindow(snapshots []NetworkSnapshot, window time.Duration) (rxBytes, txBytes uint64) {
+	if len(snapshots) < 2 {
+		return 0, 0
+	}
+
+	cutoff := time.Now().Add(-window)
+
+	// Find the first snapshot within the window
+	var startSnapshot *NetworkSnapshot
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		if snapshots[i].Timestamp.Before(cutoff) {
+			if i+1 < len(snapshots) {
+				startSnapshot = &snapshots[i+1]
+			}
+			break
+		}
+	}
+
+	if startSnapshot == nil && len(snapshots) > 0 {
+		startSnapshot = &snapshots[0]
+	}
+
+	if startSnapshot == nil {
+		return 0, 0
+	}
+
+	// Use the latest snapshot as end
+	endSnapshot := snapshots[len(snapshots)-1]
+
+	if endSnapshot.RxBytes >= startSnapshot.RxBytes {
+		rxBytes = endSnapshot.RxBytes - startSnapshot.RxBytes
+	}
+	if endSnapshot.TxBytes >= startSnapshot.TxBytes {
+		txBytes = endSnapshot.TxBytes - startSnapshot.TxBytes
+	}
+
+	return rxBytes, txBytes
+}
+
+// updateQEMUMetrics updates Prometheus metrics for QEMU processes
+func updateQEMUMetrics() {
+	// First, copy the process list to avoid holding the main lock too long
+	qemuStats.mu.RLock()
+	processMap := make(map[int]*QEMUProcessStats)
+	for pid, processStats := range qemuStats.Processes {
+		processMap[pid] = processStats
+	}
+	qemuStats.mu.RUnlock()
+
+	// Now process each one without holding the main lock
+	for _, processStats := range processMap {
+		processStats.mu.RLock()
+
+		if len(processStats.Snapshots) == 0 {
+			processStats.mu.RUnlock()
+			continue
+		}
+
+		// Get the latest snapshot for total bytes
+		latest := processStats.Snapshots[len(processStats.Snapshots)-1]
+		uuid := processStats.UUID
+
+		// Copy snapshots for window calculations to avoid holding lock during calculations
+		snapshots := make([]NetworkSnapshot, len(processStats.Snapshots))
+		copy(snapshots, processStats.Snapshots)
+
+		processStats.mu.RUnlock()
+
+		// Now we can safely update metrics without holding any locks
+		qemuTotalBytes.WithLabelValues(uuid, "rx").Set(float64(latest.RxBytes))
+		qemuTotalBytes.WithLabelValues(uuid, "tx").Set(float64(latest.TxBytes))
+
+		// Calculate windowed metrics
+		rx30s, tx30s := calculateBytesInWindow(snapshots, 30*time.Second)
+		qemu30sBytes.WithLabelValues(uuid, "rx").Set(float64(rx30s))
+		qemu30sBytes.WithLabelValues(uuid, "tx").Set(float64(tx30s))
+
+		rx1min, tx1min := calculateBytesInWindow(snapshots, 1*time.Minute)
+		qemu1minBytes.WithLabelValues(uuid, "rx").Set(float64(rx1min))
+		qemu1minBytes.WithLabelValues(uuid, "tx").Set(float64(tx1min))
+
+		rx5min, tx5min := calculateBytesInWindow(snapshots, 5*time.Minute)
+		qemu5minBytes.WithLabelValues(uuid, "rx").Set(float64(rx5min))
+		qemu5minBytes.WithLabelValues(uuid, "tx").Set(float64(tx5min))
+
+		rx15min, tx15min := calculateBytesInWindow(snapshots, 15*time.Minute)
+		qemu15minBytes.WithLabelValues(uuid, "rx").Set(float64(rx15min))
+		qemu15minBytes.WithLabelValues(uuid, "tx").Set(float64(tx15min))
+
+		rx1h, tx1h := calculateBytesInWindow(snapshots, 1*time.Hour)
+		qemu1hBytes.WithLabelValues(uuid, "rx").Set(float64(rx1h))
+		qemu1hBytes.WithLabelValues(uuid, "tx").Set(float64(tx1h))
+	}
+}
+
+// monitorQEMUProcesses periodically monitors QEMU processes
+func monitorQEMUProcesses() {
+	log.Println("Starting QEMU process monitoring...")
+
+	for {
+		select {
+		case <-qemuMonitorDone:
+			log.Println("Stopping QEMU process monitoring...")
+			return
+		case <-qemuMonitorTicker.C:
+			// Discover current QEMU processes
+			processes, err := getQEMUProcesses()
+			if err != nil {
+				log.Printf("Error discovering QEMU processes: %v", err)
+				continue
+			}
+
+			now := time.Now()
+
+			qemuStats.mu.Lock()
+
+			// Remove processes that no longer exist
+			for pid := range qemuStats.Processes {
+				if _, exists := processes[pid]; !exists {
+					log.Printf("QEMU process %d no longer exists, removing from monitoring", pid)
+					delete(qemuStats.Processes, pid)
+				}
+			}
+
+			// Update or add processes
+			for pid, uuid := range processes {
+				// Get network stats
+				rxBytes, txBytes, err := getNetworkStats(pid)
+				if err != nil {
+					log.Printf("Error reading network stats for PID %d: %v", pid, err)
+					continue
+				}
+
+				snapshot := NetworkSnapshot{
+					Timestamp: now,
+					RxBytes:   rxBytes,
+					TxBytes:   txBytes,
+				}
+
+				processStats, exists := qemuStats.Processes[pid]
+				if !exists {
+					log.Printf("Started monitoring QEMU process PID=%d UUID=%s", pid, uuid)
+					processStats = &QEMUProcessStats{
+						PID:       pid,
+						UUID:      uuid,
+						Snapshots: make([]NetworkSnapshot, 0),
+					}
+					qemuStats.Processes[pid] = processStats
+				}
+
+				processStats.mu.Lock()
+				processStats.Snapshots = append(processStats.Snapshots, snapshot)
+				// Clean old snapshots to prevent memory growth
+				processStats.Snapshots = cleanOldSnapshots(processStats.Snapshots)
+				processStats.mu.Unlock()
+			}
+
+			qemuStats.mu.Unlock()
+
+			log.Printf("Monitored %d QEMU processes", len(processes))
+		}
+	}
+}
+
+// Start a periodic metrics updater
+func startMetricsUpdater() {
+	ticker := time.NewTicker(5 * time.Second)
+	go func() {
+		for range ticker.C {
+			updatePrometheusMetrics()
+			updateQEMUMetrics()
+		}
+	}()
 }
 
 func main() {
 	flag.StringVar(&globalConfig.LogFile, "log", "/var/log/haproxy.log", "HAProxy log file to monitor")
-	flag.StringVar(&globalConfig.PositionFile, "pos", ".haproxy-sni-exporter.pos", "Position file for tail mode (relative to PWD or absolute)")
+	flag.StringVar(&globalConfig.PositionFile, "pos", ".haproxy-sni-exporter.pos", "Position file for tail mode")
 	flag.IntVar(&globalConfig.PrometheusPort, "port", 9100, "Prometheus metrics port")
-	flag.BoolVar(&globalConfig.TailMode, "tailmode", false, "Enable direct file tailing mode using nxadm/tail")
-	flag.BoolVar(&globalConfig.ResetOnStart, "reset", false, "Reset position and start from beginning of file (in tailmode)")
+	flag.BoolVar(&globalConfig.ResetOnStart, "reset", false, "Reset position and start from beginning of file")
+	flag.DurationVar(&globalConfig.QEMUMonitorInterval, "qemu-monitor-interval", 5*time.Second, "Interval for QEMU process monitoring")
 	flag.Parse()
+
+	// Start periodic metrics updater
+	startMetricsUpdater()
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/reset", resetHandler)
 	go func() {
 		log.Printf("Starting Prometheus server with /reset endpoint on :%d", globalConfig.PrometheusPort)
 		if err := http.ListenAndServe(fmt.Sprintf(":%d", globalConfig.PrometheusPort), nil); err != nil {
-			// If the server fails to start (e.g. port already in use), log fatal.
-			// Note: This doesn't stop the main() goroutine if it's already waiting on 'done'.
-			// Consider a channel to signal main() for a cleaner shutdown.
 			log.Fatalf("Failed to start HTTP server: %v", err)
 		}
 	}()
@@ -332,51 +711,44 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 
-	if globalConfig.TailMode {
-		log.Println("Tail mode (nxadm/tail) enabled.")
-		if err := startTailingInternal(globalConfig.LogFile, globalConfig.PositionFile, globalConfig.ResetOnStart); err != nil {
-			log.Fatalf("Failed to initialize tailing: %v", err)
-		}
+	// Start QEMU monitoring (always enabled)
+	log.Printf("QEMU monitoring enabled with interval: %v", globalConfig.QEMUMonitorInterval)
+	qemuMonitorTicker = time.NewTicker(globalConfig.QEMUMonitorInterval)
+	qemuMonitorDone = make(chan bool)
+	go monitorQEMUProcesses()
 
-		<-done
-		log.Println("Termination signal received. Shutting down tailer...")
+	// Start HAProxy log tailing (always enabled)
+	log.Println("HAProxy log tailing enabled.")
+	if err := startTailingInternal(globalConfig.LogFile, globalConfig.PositionFile, globalConfig.ResetOnStart); err != nil {
+		log.Printf("Warning: Failed to initialize HAProxy log tailing: %v", err)
+		log.Println("Continuing with QEMU monitoring only...")
+	}
 
-		currentTailInstanceLock.Lock()
-		if currentTailInstance != nil {
-			log.Println("Stopping current tail instance...")
-			if err := currentTailInstance.Stop(); err != nil { // Stop should be enough for graceful shutdown
-				log.Printf("Error stopping tail instance during shutdown: %v", err)
-			}
-		}
-		currentTailInstanceLock.Unlock() // Unlock before Wait to avoid deadlock if Done() tries to lock
+	<-done
+	log.Println("Termination signal received. Shutting down...")
 
-		log.Println("Waiting for tailing goroutine (processTailLines) to complete...")
-		tailWg.Wait()
-		log.Println("Tailing stopped. Exiting.")
-
-	} else {
-		log.Println("Stdin mode enabled. Reading from stdin...")
-		stdinDone := make(chan struct{}) // Channel to signal stdin processing completion
-		go func() {
-			defer close(stdinDone) // Signal completion
-			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
-				line := scanner.Text()
-				processLine(line)
-			}
-			if err := scanner.Err(); err != nil {
-				log.Printf("Error reading stdin: %v", err)
-			}
-			log.Println("Stdin reader finished.")
-		}()
-
-		select {
-		case <-done:
-			log.Println("Termination signal received. Shutting down...")
-			// os.Stdin.Close() // This can help unblock the scanner if it's stuck on Read
-		case <-stdinDone:
-			log.Println("Stdin processing finished. Application will now exit.")
+	// Stop HAProxy log tailing
+	currentTailInstanceLock.Lock()
+	if currentTailInstance != nil {
+		log.Println("Stopping HAProxy log tailer...")
+		if err := currentTailInstance.Stop(); err != nil {
+			log.Printf("Error stopping tail instance during shutdown: %v", err)
 		}
 	}
+	currentTailInstanceLock.Unlock()
+
+	log.Println("Waiting for tailing goroutine to complete...")
+	tailWg.Wait()
+	log.Println("HAProxy log tailing stopped.")
+
+	// Stop QEMU monitoring
+	log.Println("Stopping QEMU monitoring...")
+	if qemuMonitorTicker != nil {
+		qemuMonitorTicker.Stop()
+	}
+	if qemuMonitorDone != nil {
+		close(qemuMonitorDone)
+	}
+
 	log.Println("Application shut down gracefully.")
 }
