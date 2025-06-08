@@ -22,6 +22,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// Version information (will be set during build time)
+var (
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildTime = "unknown"
+)
+
 // Config global config
 var globalConfig struct {
 	LogFile             string
@@ -1035,6 +1042,8 @@ func startMetricsUpdater() {
 }
 
 func main() {
+	var showVersion bool
+	flag.BoolVar(&showVersion, "version", false, "Show version information and exit")
 	flag.StringVar(&globalConfig.LogFile, "log", "/var/log/haproxy.log", "HAProxy log file to monitor")
 	flag.StringVar(&globalConfig.PositionFile, "pos", ".traffic-exporter.pos", "Position file for tail mode")
 	flag.IntVar(&globalConfig.PrometheusPort, "port", 9100, "Prometheus metrics port")
@@ -1042,6 +1051,15 @@ func main() {
 	flag.DurationVar(&globalConfig.QEMUMonitorInterval, "qemu-monitor-interval", 5*time.Second, "Interval for QEMU process monitoring")
 	flag.StringVar(&globalConfig.DomainSuffix, "domain-suffix", "phala.network", "Domain suffix for app ID extraction (e.g., phala.network)")
 	flag.Parse()
+
+	// Handle version flag
+	if showVersion {
+		fmt.Printf("dstack-traffic-exporter\n")
+		fmt.Printf("Version: %s\n", Version)
+		fmt.Printf("Git Commit: %s\n", GitCommit)
+		fmt.Printf("Build Time: %s\n", BuildTime)
+		os.Exit(0)
+	}
 
 	// Start periodic metrics updater
 	startMetricsUpdater()
