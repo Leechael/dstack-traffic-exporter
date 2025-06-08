@@ -34,6 +34,7 @@ var globalConfig struct {
 	LogFile             string
 	PositionFile        string
 	PrometheusPort      int
+	PrometheusHost      string
 	ResetOnStart        bool
 	QEMUMonitorInterval time.Duration
 	DomainSuffix        string
@@ -1047,6 +1048,7 @@ func main() {
 	flag.StringVar(&globalConfig.LogFile, "log", "/var/log/haproxy.log", "HAProxy log file to monitor")
 	flag.StringVar(&globalConfig.PositionFile, "pos", ".traffic-exporter.pos", "Position file for tail mode")
 	flag.IntVar(&globalConfig.PrometheusPort, "port", 9100, "Prometheus metrics port")
+	flag.StringVar(&globalConfig.PrometheusHost, "host", "0.0.0.0", "Prometheus server listen host")
 	flag.BoolVar(&globalConfig.ResetOnStart, "reset", false, "Reset position and start from beginning of file")
 	flag.DurationVar(&globalConfig.QEMUMonitorInterval, "qemu-monitor-interval", 5*time.Second, "Interval for QEMU process monitoring")
 	flag.StringVar(&globalConfig.DomainSuffix, "domain-suffix", "phala.network", "Domain suffix for app ID extraction (e.g., phala.network)")
@@ -1067,9 +1069,11 @@ func main() {
 	http.Handle("/metrics", promhttp.Handler())
 	http.HandleFunc("/reset", resetHandler)
 	http.HandleFunc("/query", queryHandler)
+
 	go func() {
-		log.Printf("Starting Prometheus server with /reset and /query endpoints on :%d", globalConfig.PrometheusPort)
-		if err := http.ListenAndServe(fmt.Sprintf(":%d", globalConfig.PrometheusPort), nil); err != nil {
+		addr := fmt.Sprintf("%s:%d", globalConfig.PrometheusHost, globalConfig.PrometheusPort)
+		log.Printf("Starting Prometheus server with /reset and /query endpoints on %s", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Fatalf("Failed to start HTTP server: %v", err)
 		}
 	}()
